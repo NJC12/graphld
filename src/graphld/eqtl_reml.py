@@ -469,7 +469,8 @@ def run_eqtl_graphREML(
         print(f"Sample size N={model_options.sample_size}")
         print(f"link_fn_denominator={model_options.link_fn_denominator}")
 
-    return EqtlGraphREML.run_serial(
+    run_fn = EqtlGraphREML.run_serial if method_options.run_serial else EqtlGraphREML.run
+    return run_fn(
         ldgm_metadata_path,
         populations=populations,
         chromosomes=chromosomes,
