@@ -17,6 +17,11 @@ from graphld.vcf_io import read_gwas_vcf
 from .heritability import MethodOptions, ModelOptions, run_graphREML
 from .io import load_annotations
 from .surrogates import get_surrogate_markers
+from .eqtl_io import (
+    load_egenes, load_eqtl_sumstats, compute_eqtl_sample_size,
+    map_genes_to_blocks, compute_link_fn_denominator,
+)
+from .eqtl_reml import run_eqtl_graphREML
 
 
 def _construct_cmd_string(args, parser):
@@ -502,6 +507,215 @@ def write_convergence_results(filename: str, results: dict):
         f.write('iteration,likelihood_change,trust_region_lambda\n')
         for i, (change, trust_lambda) in enumerate(zip(log['likelihood_changes'], log['trust_region_lambdas'], strict=False)):
             f.write(f"{i+1},{change},{trust_lambda}\n")
+
+def _eqtl_reml(args):
+    """Run eQTL GraphREML command."""
+    start_time = time.time()
+
+    # Create output directory
+    if args.out:
+        out_dir = os.path.dirname(args.out)
+        if out_dir and not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
+        tall_output = args.out + '.tall.csv'
+        if os.path.exists(tall_output):
+            raise FileExistsError(f"Output file {tall_output} already exists")
+
+    # 1. Load eGenes
+    if not args.quiet:
+        print(f"Loading eGenes from {args.egenes}")
+    egenes = load_egenes(args.egenes, args.qval_threshold)
+    if not args.quiet:
+        print(f"  {len(egenes)} eGenes (qval <= {args.qval_threshold})")
+
+    # 2. Load LDGM metadata
+    from .io import read_ldgm_metadata
+    metadata = read_ldgm_metadata(
+        args.metadata,
+        populations=[args.population] if args.population else None,
+        chromosomes=[args.chromosome] if args.chromosome else None,
+    )
+
+    # 3. Map genes to blocks
+    block_to_genes, gene_to_blocks = map_genes_to_blocks(
+        egenes, metadata, window=args.cis_window,
+    )
+    if not args.quiet:
+        n_used = len(block_to_genes)
+        total_pairs = sum(len(v) for v in block_to_genes.values())
+        print(f"  {n_used} blocks with genes, {total_pairs} gene-block pairs")
+
+    # 4. Load eQTL sumstats
+    chromosomes = [args.chromosome] if args.chromosome else None
+    if not args.quiet:
+        print(f"Loading eQTL sumstats from {args.eqtl_dir}")
+    eqtl_sumstats = load_eqtl_sumstats(
+        args.eqtl_dir, args.tissue, egenes["gene_id"], chromosomes,
+    )
+    if not args.quiet:
+        print(f"  {len(eqtl_sumstats)} variant-gene pairs, {eqtl_sumstats['gene_id'].n_unique()} genes")
+
+    # 5. Compute sample size
+    if args.num_samples:
+        sample_size = float(args.num_samples)
+    else:
+        # Derive from first available parquet
+        from pathlib import Path
+        parquet_dir = Path(args.eqtl_dir)
+        first_chrom = chromosomes[0] if chromosomes else 1
+        first_parquet = parquet_dir / f"{args.tissue}.v10.allpairs.chr{first_chrom}.parquet"
+        sample_size = compute_eqtl_sample_size(str(first_parquet))
+    if not args.quiet:
+        print(f"  Sample size N={sample_size:.0f}")
+
+    # 6. Load annotations
+    if not args.quiet:
+        print(f"Loading annotations from {args.annot_dir}")
+    annotations = load_annotations(
+        args.annot_dir,
+        chromosome=args.chromosome,
+    )
+    annotation_columns = [
+        c for c in annotations.columns if c not in ["SNP", "CHR", "POS", "CM", "BP"]
+    ]
+    if args.binary_annotations_only:
+        from .heritability import _filter_binary_annotations
+        annotations, annotation_columns = _filter_binary_annotations(
+            annotations, annotation_columns, args.verbose,
+        )
+    if not args.quiet:
+        print(f"  {len(annotation_columns)} annotations, {len(annotations)} variants")
+
+    # 7. Compute link_fn_denominator
+    link_fn_denom = compute_link_fn_denominator(eqtl_sumstats)
+    if not args.quiet:
+        print(f"  link_fn_denominator={link_fn_denom}")
+
+    # 8. Build options and run
+    model_options = ModelOptions(
+        sample_size=sample_size,
+        intercept=args.intercept,
+        annotation_columns=annotation_columns,
+        link_fn_denominator=link_fn_denom,
+        binary_annotations_only=False,  # already filtered above
+    )
+
+    method_options = MethodOptions(
+        match_by_position=True,
+        num_iterations=args.num_iterations,
+        convergence_tol=args.convergence_tol,
+        convergence_window=args.convergence_window,
+        run_serial=True,  # eQTL v1 is serial only
+        num_processes=args.num_processes,
+        verbose=args.verbose,
+        num_jackknife_blocks=args.num_jackknife_blocks,
+        gradient_num_samples=args.xtrace_num_samples,
+        use_surrogate_markers=False,
+    )
+
+    results = run_eqtl_graphREML(
+        model_options=model_options,
+        method_options=method_options,
+        annotation_data=annotations,
+        eqtl_sumstats=eqtl_sumstats,
+        block_to_genes=block_to_genes,
+        ldgm_metadata_path=args.metadata,
+        populations=[args.population] if args.population else None,
+        chromosomes=[args.chromosome] if args.chromosome else None,
+    )
+
+    # 9. Write output
+    if args.out:
+        write_tall_results(tall_output, model_options, results)
+        conv_output = args.out + '.convergence.csv'
+        write_convergence_results(conv_output, results)
+        if not args.quiet:
+            print(f"Results written to {tall_output}")
+
+    runtime = time.time() - start_time
+    if not args.quiet:
+        print(f"Total time: {runtime:.1f}s")
+
+    return results
+
+
+def _add_eqtl_reml_parser(subparsers):
+    """Add parser for eqtl-reml command."""
+    parser = subparsers.add_parser(
+        'eqtl-reml',
+        help='Run eQTL GraphREML (pooled cis-eQTL heritability)',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # eQTL-specific required arguments
+    parser.add_argument(
+        '--eqtl-dir', required=True,
+        help='Directory containing {tissue}.v10.allpairs.chr{N}.parquet files',
+    )
+    parser.add_argument(
+        '--tissue', required=True,
+        help='Tissue name (e.g., Adipose_Subcutaneous)',
+    )
+    parser.add_argument(
+        '--egenes', required=True,
+        help='Path to eGenes.txt.gz file',
+    )
+    parser.add_argument(
+        '-a', '--annot-dir', required=True,
+        help='Path to annotation directory with per-chromosome .annot files',
+    )
+
+    # Output
+    parser.add_argument(
+        'out', nargs='?', default=None,
+        help='Output file path (optional)',
+    )
+
+    # eQTL-specific optional arguments
+    parser.add_argument(
+        '--qval-threshold', type=float, default=0.05,
+        help='Q-value threshold for eGene significance',
+    )
+    parser.add_argument(
+        '--cis-window', type=int, default=1_000_000,
+        help='Cis-window size in bp from TSS',
+    )
+    parser.add_argument(
+        '--binary-annotations-only', action='store_true', default=False,
+        help='Only use binary (0/1) annotations',
+    )
+
+    # Common REML arguments
+    parser.add_argument(
+        '--intercept', type=float, default=1.0,
+        help='LD score regression intercept',
+    )
+    parser.add_argument(
+        '--num-iterations', type=int, default=50,
+        help='Maximum number of iterations',
+    )
+    parser.add_argument(
+        '--convergence-tol', type=float, default=1e-2,
+        help='Convergence tolerance',
+    )
+    parser.add_argument(
+        '--convergence-window', type=int, default=3,
+        help='Number of iterations for convergence check',
+    )
+    parser.add_argument(
+        '--num-jackknife-blocks', type=int, default=100,
+        help='Number of jackknife blocks',
+    )
+    parser.add_argument(
+        '--xtrace-num-samples', type=int, default=100,
+        help='Number of samples for gradient estimation',
+    )
+
+    # Add common arguments (metadata, population, chromosome, etc.)
+    _add_common_arguments(parser)
+
+    parser.set_defaults(func=_eqtl_reml)
+
 
 def _run_reml_single_trait(
     args,
@@ -1107,6 +1321,9 @@ def _main(args):
     # GraphREML command
     _add_reml_parser(subp)
 
+    # eQTL GraphREML command
+    _add_eqtl_reml_parser(subp)
+
     # Parse arguments
     parsed_args = argp.parse_args(args)
 
@@ -1190,6 +1407,8 @@ def _main(args):
         )
     elif parsed_args.cmd == "reml":
         return _reml(parsed_args)
+    elif parsed_args.cmd == "eqtl-reml":
+        return _eqtl_reml(parsed_args)
 
 def main():
     """Entry point for the graphld command line interface."""

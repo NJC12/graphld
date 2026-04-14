@@ -509,6 +509,108 @@ class GraphREML(ParallelProcessor):
                 )
 
     @staticmethod
+    def _update_block_model(
+        ldgm: PrecisionOperator,
+        annotations: np.ndarray,
+        params: np.ndarray,
+        link_fn_denominator: float,
+        old_variant_h2: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Update the block's precision matrix diagonal and compute derivatives.
+
+        Computes per-variant heritability from annotations and params, updates the
+        LDGM diagonal, and builds del_M_del_a for gradient/hessian computation.
+        The Cholesky factorization is invalidated but not recomputed here; it will
+        be triggered lazily by the next gaussian_likelihood call.
+
+        Args:
+            ldgm: LDGM object (modified in place)
+            annotations: Annotation matrix (num_variants x num_params)
+            params: Model parameters (num_params x 1)
+            link_fn_denominator: Softmax denominator
+            old_variant_h2: Previous per-variant h2 values
+
+        Returns:
+            Tuple containing:
+            - per_variant_h2: Current per-variant heritabilities
+            - del_M_del_a: Derivative of precision diagonal wrt parameters
+              (matrix_size x num_params)
+        """
+        link_fn, link_fn_grad, _ = _get_softmax_link_function(link_fn_denominator)
+
+        # Compute change in diag(M), aggregating variants with same index
+        per_variant_h2 = link_fn(annotations, params)
+        delta_D = np.zeros(ldgm.shape[0])
+        np.add.at(
+            delta_D,
+            ldgm.variant_indices,
+            per_variant_h2.flatten() - old_variant_h2.flatten(),
+        )
+
+        # Update diag(M)
+        ldgm.update_matrix(delta_D)
+
+        # Gradient of per-variant h2 wrt parameters
+        del_h2_del_a = link_fn_grad(annotations, params)
+
+        # Gradient of diag(M)
+        del_M_del_a = np.zeros((ldgm.shape[0], params.shape[0]))
+        np.add.at(del_M_del_a, ldgm.variant_indices, del_h2_del_a)
+
+        return per_variant_h2, del_M_del_a
+
+    @staticmethod
+    def _compute_gene_contribution(
+        Pz: np.ndarray,
+        ldgm: PrecisionOperator,
+        del_M_del_a: np.ndarray,
+        num_samples: int,
+        likelihood_only: bool,
+        seed: Optional[int] = None,
+    ) -> Tuple[float, Optional[np.ndarray], Optional[np.ndarray]]:
+        """Compute likelihood, gradient, and hessian for one set of Z-scores.
+
+        Reuses the existing Cholesky factorization in ldgm (triggering
+        refactorization on the first call after a diagonal update). Does NOT
+        call del_factor() — the caller is responsible for cleanup.
+
+        Args:
+            Pz: Z-scores premultiplied by precision matrix
+            ldgm: LDGM object with current diagonal
+            del_M_del_a: Derivative of precision diagonal wrt parameters
+            num_samples: Number of samples for gradient estimation
+            likelihood_only: If True, skip gradient and hessian
+            seed: Random seed for gradient estimation
+
+        Returns:
+            Tuple containing:
+            - likelihood: Log likelihood value
+            - gradient: Gradient vector (or None if likelihood_only)
+            - hessian: Hessian matrix (or None if likelihood_only)
+        """
+        likelihood = gaussian_likelihood(Pz, ldgm)
+
+        if likelihood_only:
+            return likelihood, None, None
+
+        gradient = gaussian_likelihood_gradient(
+            Pz,
+            ldgm,
+            del_M_del_a=del_M_del_a,
+            n_samples=num_samples,
+            seed=seed,
+        )
+
+        hessian = gaussian_likelihood_hessian(
+            Pz,
+            ldgm,
+            del_M_del_a=del_M_del_a,
+            seed=seed,
+        )
+
+        return likelihood, gradient, hessian
+
+    @staticmethod
     def _compute_block_likelihood(
         ldgm: PrecisionOperator,
         Pz: np.ndarray,
@@ -527,8 +629,11 @@ class GraphREML(ParallelProcessor):
             Pz: Z-scores premultiplied by precision matrix
             annotations: Annotation matrix
             params: Model parameters
-            num_snps: Total number of SNPs
+            link_fn_denominator: Softmax denominator
             old_variant_h2: Previous values of variant_h2, so that ldgm is updated using the difference
+            num_samples: Number of samples for gradient estimation
+            likelihood_only: If True, skip gradient and hessian
+            seed: Random seed for gradient estimation
 
         Returns:
             Tuple containing:
@@ -537,48 +642,12 @@ class GraphREML(ParallelProcessor):
             - hessian: Hessian matrix
             - per_variant_h2: With current parameters, heritability per variant
         """
-        link_fn, link_fn_grad, _ = _get_softmax_link_function(link_fn_denominator)
-
-        # Compute change in diag(M), aggregating variants with same index
-        per_variant_h2 = link_fn(annotations, params)
-        delta_D = np.zeros(ldgm.shape[0])
-        np.add.at(
-            delta_D,
-            ldgm.variant_indices,
-            per_variant_h2.flatten() - old_variant_h2.flatten(),
+        per_variant_h2, del_M_del_a = GraphREML._update_block_model(
+            ldgm, annotations, params, link_fn_denominator, old_variant_h2,
         )
 
-        # Update diag(M)
-        ldgm.update_matrix(delta_D)
-
-        # New log likelihood
-        likelihood = gaussian_likelihood(Pz, ldgm)
-
-        if likelihood_only:
-            ldgm.del_factor()  # To reduce memory usage
-            return likelihood, None, None, per_variant_h2
-
-        # Gradient of per-variant h2 wrt parameters
-        del_h2_del_a = link_fn_grad(annotations, params)
-
-        # Gradient of diag(M)
-        del_M_del_a = np.zeros((ldgm.shape[0], params.shape[0]))
-        np.add.at(del_M_del_a, ldgm.variant_indices, del_h2_del_a)
-
-        # Gradient of log likelihood
-        gradient = gaussian_likelihood_gradient(
-            Pz,
-            ldgm,
-            del_M_del_a=del_M_del_a,
-            n_samples=num_samples,
-            seed=seed,
-        )
-
-        hessian = gaussian_likelihood_hessian(
-            Pz,
-            ldgm,
-            del_M_del_a=del_M_del_a,
-            seed=seed,
+        likelihood, gradient, hessian = GraphREML._compute_gene_contribution(
+            Pz, ldgm, del_M_del_a, num_samples, likelihood_only, seed,
         )
 
         ldgm.del_factor()  # To reduce memory usage
